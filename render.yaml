@@ -1,33 +1,13 @@
 services:
   - type: web
-    name: brag-legal-api
+    name: brag-gemini-lawfirm-rag
     env: python
-    plan: free         # or starter
-    region: oregon     # pick your region
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
-    healthCheckPath: /healthz
-    autoDeploy: true
+    plan: free
+    runtime: python
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port 10000"
     envVars:
-      - key: SERVE_FRONTEND
-        value: "1"             # serves /ui from ./frontend
-      - key: LOG_LEVEL
-        value: INFO
-      # === Gemini / Qdrant Config (set real values via Render dashboard secrets) ===
-      - key: GEMINI_API_KEY
-        sync: from-dashboard
-      - key: QDRANT_MODE
-        value: cloud
-      - key: QDRANT_URL         # e.g. https://xxxx-xxx.gcp.cloud.qdrant.io:6333
-        sync: from-dashboard
-      - key: QDRANT_API_KEY
-        sync: from-dashboard
-      - key: QDRANT_COLLECTION
-        value: law_docs_gemini_v1
-      - key: QDRANT_COLLECTION_ALIAS
-        value: law_docs_gemini_current
-      # Optional web search
-      - key: TAVILY_API_KEY
-        sync: from-dashboard
-      - key: WEB_SEARCH_ENABLED
-        value: "true"
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: PORT
+        value: 10000
