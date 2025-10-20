@@ -4,6 +4,7 @@ Provides a global LLM instance that can be accessed from anywhere in the applica
 """
 
 import logging
+import os
 from typing import Optional, List, Dict, Any
 from openai import AsyncOpenAI
 from core.config import settings
@@ -33,15 +34,18 @@ class GlobalLLMService:
         """Set up the OpenAI client based on current settings."""
         try:
             if settings.LLM_PROVIDER == "openai":
+                api_key = os.getenv("OPENAI_API_KEY")
                 self._client = AsyncOpenAI(
-                    api_key=settings.OPENAI_API_KEY,
+                    api_key=api_key,
                     timeout=60.0,
                     max_retries=3
                 )
             elif settings.LLM_PROVIDER == "azure_openai":
+                azure_key = os.getenv("AZURE_OPENAI_API_KEY")
+                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
                 self._client = AsyncOpenAI(
-                    api_key=settings.AZURE_OPENAI_API_KEY,
-                    azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+                    api_key=azure_key,
+                    azure_endpoint=azure_endpoint,
                     api_version="2024-02-01",
                     timeout=60.0,
                     max_retries=3
@@ -201,7 +205,7 @@ class GlobalLLMService:
             "temperature_legal": settings.LLM_TEMPERATURE_LEGAL,
             "max_tokens": settings.LLM_MAX_TOKENS,
             "is_available": self.is_available,
-            "has_api_key": bool(settings.OPENAI_API_KEY or settings.AZURE_OPENAI_API_KEY)
+            "has_api_key": bool(os.getenv("OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_API_KEY"))
         }
 
 

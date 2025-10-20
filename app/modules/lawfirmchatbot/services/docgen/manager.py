@@ -1,9 +1,37 @@
 # app/modules/lawfirmchatbot/services/docgen/manager.py
 
+import logging
 import re, json, html
 from typing import List, Dict, Optional, Tuple
 from app.modules.lawfirmchatbot.services.retrieval.vector_search import search_similar_documents
 from app.modules.lawfirmchatbot.services.llm import chat_completion
+from app.modules.lawfirmchatbot.services.prompts.docgen import generate_docgen_prompt
+from app.modules.lawfirmchatbot.services.rag.llm import generate_llm_response
+
+logger = logging.getLogger("RAGLogger")
+
+
+def generate_document(prompt: str, doc_type: str = "legal_draft", placeholders: bool = False) -> str:
+    """
+    Handles document generation using Gemini LLM.
+    Ensures placeholder mode actually generates draft content.
+    """
+    logger.info(f"📑 DocGen request started | Type: {doc_type} | Placeholders={placeholders}")
+
+    try:
+        doc_prompt = generate_docgen_prompt(prompt, doc_type=doc_type, placeholders=placeholders)
+        response = generate_llm_response(doc_prompt, task_type=doc_type)
+        if not response or "please provide the following missing details" in response.lower():
+            logger.warning("⚠️ Gemini returned insufficient content, reattempting with placeholder directive.")
+            response = generate_llm_response(
+                f"{doc_prompt}\nIf required information is missing, fill with [PLACEHOLDER]. Do not request additional input.",
+                task_type=doc_type,
+            )
+        return response
+
+    except Exception as e:
+        logger.exception(f"❌ DocGen failed: {e}")
+        return "[DocGen Error] " + str(e)
 
 # -------------------- Intents & detection (typo tolerant) --------------------
 DOCGEN_VERBS = r"(generate|draft|make|prepare|compose|create)"

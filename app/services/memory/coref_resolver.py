@@ -2,17 +2,28 @@
 
 import os
 import json
-from typing import List, Dict
+from typing import List, Dict, Optional
 from openai import AsyncOpenAI
 from core.config import settings
 
-# Initialize OpenAI client
-_client: AsyncOpenAI | None = None
+# Initialize OpenAI client (used only when provider supports it)
+_client: Optional[AsyncOpenAI] = None
 
-def _get_client() -> AsyncOpenAI:
+
+def _use_openai() -> bool:
+    provider = (os.getenv("LLM_PROVIDER") or settings.LLM_PROVIDER or "").strip().lower()
+    return provider in {"openai", "azure_openai"}
+
+
+def _get_client() -> Optional[AsyncOpenAI]:
     global _client
+    if not _use_openai():
+        return None
     if _client is None:
-        _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, timeout=6)
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        _client = AsyncOpenAI(api_key=api_key, timeout=6)
     return _client
 
 SYSTEM = (
@@ -58,6 +69,8 @@ async def chat_completion_raw(messages: List[Dict[str, str]], model: str = None,
         Raw text response
     """
     client = _get_client()
+    if client is None:
+        raise RuntimeError("Coreference resolver requires OpenAI but no client is configured.")
     
     # Use fast model for coreference (gpt-4o-mini or similar)
     if model is None:
@@ -89,6 +102,13 @@ async def resolve_coref(history: List[Dict[str, str]], user_text: str) -> str:
     Returns:
         Resolved query string
     """
+    if not _use_openai():
+        return user_text
+
+    client = _get_client()
+    if client is None:
+        return user_text
+
     history_preview = build_history_preview(history)
     user = (
         "Recent dialogue (most recent last):\n"

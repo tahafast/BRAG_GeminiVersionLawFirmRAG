@@ -216,7 +216,7 @@ async def add_documents_to_vector_store(documents: List[Document]) -> int:
             except Exception as e:
                 logger.error(f"Batch embedding failed for batch {batch_num}: {e}")
                 # Use zero vectors as fallback
-                embeddings = [[0.0] * 1536 for _ in texts]
+                embeddings = [[0.0] * settings.EMBED_MODEL_DIM for _ in texts]
             
             # Create points
             points = []

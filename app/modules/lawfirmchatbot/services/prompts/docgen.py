@@ -1,11 +1,61 @@
-from typing import Dict, Sequence, Any
-
+from typing import Dict, Sequence, Any, List
+from os import getenv
 
 COMMON_DIRECTIVE = (
     " Always output the finished document as filing-ready HTML (use <div>, <p>, <ol>, <table> as needed)"
     " without markdown code fences or meta commentary. Include appropriate headings, verification/attestation,"
     " and signature blocks when customary."
 )
+
+REQUIRED_FIELD_KEYWORDS: Dict[str, List[str]] = {
+    "case type number": ["case no", "case number", "suit no", "petition no", "w.p.", "wp", "fir no"],
+    "case title": [" v ", " vs ", "versus", "title"],
+    "representing": ["petitioner", "respondent", "plaintiff", "defendant", "applicant", "represent"],
+    "deponent": ["deponent", "i,", "we,"],
+    "address": ["address", "resident", "residing", "at "],
+    "capacity": ["authorized", "attorney", "capacity", "under instruction", "through"],
+}
+
+
+def detect_missing_fields(user_prompt: str) -> List[str]:
+    """
+    Heuristic detection of commonly required document attributes.
+    Used only for non-placeholder flows.
+    """
+    text = (user_prompt or "").lower()
+    missing = []
+    for field, tokens in REQUIRED_FIELD_KEYWORDS.items():
+        if not any(token in text for token in tokens):
+            missing.append(field)
+    return missing
+
+
+def generate_docgen_prompt(user_prompt: str, doc_type: str = "legal document", placeholders: bool = False) -> str:
+    """
+    Modified DocGen prompt builder with Gemini placeholder support.
+    """
+    provider = getenv("LLM_PROVIDER", "gemini")
+    doc_label = (doc_type or "legal document").replace("_", " ")
+
+    if placeholders or provider.lower() == "gemini":
+        return (
+            f"Draft a structured {doc_label} based on the following request:\n\n"
+            f"'{user_prompt}'\n\n"
+            "Use [PLACEHOLDER] where details like case number, title, address, or capacity are missing.\n"
+            "Ensure a professional legal format with clear sections (heading, parties, grounds, prayer)."
+        )
+
+    missing_fields = detect_missing_fields(user_prompt)
+    if missing_fields:
+        return (
+            f"To draft your document, please provide the following missing details: {', '.join(missing_fields)}."
+        )
+
+    return (
+        f"Draft a complete, formal {doc_label} based on the following request:\n\n"
+        f"{user_prompt}\n\n"
+        "Follow standard legal structure (heading, parties, body, prayer)."
+    )
 
 DOCGEN_PROMPTS: Dict[str, str] = {
     "affidavit": (
@@ -42,6 +92,7 @@ def build_docgen_prompt(
     user_query: str,
     answers: Dict[str, str],
     context: Sequence[Any],
+    use_placeholders: bool = False,
 ) -> str:
     """
     Prepare the user prompt for doc generation with explicit references.
@@ -61,11 +112,21 @@ def build_docgen_prompt(
 
     refs = "\n\n---\n\n".join(context_snippets) if context_snippets else "[No retrieved context available]"
 
+    placeholder_rules = (
+        "If facts are missing, insert [PLACEHOLDER] and keep the document structure intact.\n"
+        "Do not fabricate names, dates, or case numbers; prefer placeholders instead."
+    )
+    strong_skeleton_rules = (
+        "Output a minimal skeleton/template with headings and standard sections only.\n"
+        "Use [PLACEHOLDER] for parties, dates, addresses, case numbers, and specifics.\n"
+        "Do not expand into narrative text; avoid verbose paragraphs and examples."
+    ) if use_placeholders else ""
+
     return (
         f'You are drafting based on this user intent: "{user_query}"\n\n'
         f"DETAILS:\n{details}\n\n"
         "REFERENCE DOCUMENTS (use their structure, tone, and style as guidance):\n"
         f"{refs}\n\n"
-        "If facts are missing, insert [PLACEHOLDER] and keep the document structure intact.\n"
-        "Do not fabricate names, dates, or case numbers; prefer placeholders instead."
+        f"{placeholder_rules}\n"
+        f"{strong_skeleton_rules}"
     )

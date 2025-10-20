@@ -13,17 +13,19 @@ services:
         value: "1"             # serves /ui from ./frontend
       - key: LOG_LEVEL
         value: INFO
-      # === Qdrant Cloud (fill these in the dashboard as "From dashboard" if you prefer secrets) ===
+      # === Gemini / Qdrant Config (set real values via Render dashboard secrets) ===
+      - key: GEMINI_API_KEY
+        sync: from-dashboard
       - key: QDRANT_MODE
         value: cloud
-      - key: QDRANT_URL         # e.g. https://xxxx-xxx.gcp.cloud.qdrant.io
-        sync: https://9c1cc1f3-92a0-461d-bec1-a8d6813696d3.us-east4-0.gcp.cloud.qdrant.io:6333
+      - key: QDRANT_URL         # e.g. https://xxxx-xxx.gcp.cloud.qdrant.io:6333
+        sync: from-dashboard
       - key: QDRANT_API_KEY
-        sync: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.22A1dUFI4HldggwcNp_TDV8wlHhAEj9M9zK6fFdct6I
+        sync: from-dashboard
       - key: QDRANT_COLLECTION
-        value: law_docs_v1
+        value: law_docs_gemini_v1
       - key: QDRANT_COLLECTION_ALIAS
-        value: law_docs_current
+        value: law_docs_gemini_current
       # Optional web search
       - key: TAVILY_API_KEY
         sync: from-dashboard

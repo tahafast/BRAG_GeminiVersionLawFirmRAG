@@ -9,7 +9,14 @@ from fastapi.responses import RedirectResponse, PlainTextResponse
 from app.modules.router import router as modules_router
 from core.config import settings, wire_services, perform_warmup
 from core.logging import get_logger
-logger = get_logger(__name__)
+from app.modules.lawfirmchatbot.services.vector_store import (
+    get_qdrant_client,
+    get_active_collection,
+    ensure_alias,
+)
+from app.modules.lawfirmchatbot.services.rag.llm import detect_active_llm
+
+logger = get_logger("RAGLogger")
 
 
 def create_app():
@@ -68,8 +75,26 @@ async def healthz():
 @app.on_event("startup")
 async def startup_event():
     """Application startup event handler."""
-    logger.info("Starting Law Firm Chatbot API...")
-    
+    logger.info("🚀 Starting LawFirm Gemini RAG backend initialization...")
+
+    try:
+        client = get_qdrant_client()
+        ensure_alias(client)
+        active_alias = get_active_collection()
+        logger.info(f"✅ Qdrant alias confirmed — Active collection: {active_alias}")
+
+        llm_config = detect_active_llm()
+        logger.info(
+            "🧠 LLM provider: %s | Fast: %s | Heavy: %s",
+            llm_config.get("provider"),
+            llm_config.get("fast"),
+            llm_config.get("heavy"),
+        )
+
+        logger.info("✨ Gemini RAG system successfully initialized and ready.")
+    except Exception as e:
+        logger.exception(f"❌ Startup initialization failed: {e}")
+
     # Initialize database tables
     try:
         from app.services.memory.init_db import init_database

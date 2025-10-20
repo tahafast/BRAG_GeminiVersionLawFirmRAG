@@ -1,7 +1,9 @@
 from typing import Iterable, List, Dict, Any, Optional
 import time
 import logging
+import os
 from qdrant_client import QdrantClient
+from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams, PointStruct, HnswConfigDiff, PayloadSchemaType
 from langchain.schema import Document
 from core.config import settings
@@ -10,7 +12,18 @@ from core.config import settings
 import core.logging  # This sets up logging configuration
 logger = logging.getLogger("qdrant.client")
 
-_ALIAS_ENABLED = True  # flipped off if alias ops unsupported/fail
+# === Gemini migration additions ===
+QDRANT_COLLECTION_ALIAS = os.getenv(
+    "QDRANT_COLLECTION_ALIAS",
+    getattr(settings, "QDRANT_COLLECTION_ALIAS", "law_docs_gemini_current"),
+)
+QDRANT_COLLECTION = os.getenv(
+    "QDRANT_COLLECTION",
+    getattr(settings, "QDRANT_COLLECTION", "law_docs_gemini_v1"),
+)
+DEFAULT_VECTOR_DIM = getattr(settings, "EMBED_MODEL_DIM", 768)
+
+_ALIAS_ENABLED = False  # flipped on once alias verified
 
 
 _qdrant_client = None
@@ -59,7 +72,7 @@ def _alias_name() -> str:
 
 def get_runtime_collection_name() -> str:
     """Single stable name used by both ingestion and retrieval."""
-    return _alias_name()
+    return _alias_name() if _ALIAS_ENABLED else _physical_name()
 
 
 def get_vector_name() -> str | None:
@@ -70,7 +83,7 @@ def get_vector_name() -> str | None:
 
 def _ensure_collection(client: QdrantClient) -> None:
     """Legacy internal function - delegates to hardened ensure_collection."""
-    ensure_collection(client, dim=1536)
+    ensure_collection(client)
 
 
 def _retry_with_backoff(func, max_retries: int = 3, base_delay: float = 1.0, timeout: float = 30.0):
@@ -105,42 +118,73 @@ def use_alias_name() -> str:
     return get_runtime_collection_name()
 
 
-def ensure_collection(client: QdrantClient, dim: int) -> None:
+def ensure_collection(client: QdrantClient, dim: Optional[int] = None) -> None:
     """Ensure physical collection exists and optionally set up alias if different from physical."""
+    global _ALIAS_ENABLED
+
     physical = _physical_name()
     alias = _alias_name()
+    expected_dim = getattr(settings, "EMBED_MODEL_DIM", DEFAULT_VECTOR_DIM)
+    target_dim = dim if dim is not None else expected_dim
+    if target_dim != expected_dim:
+        logger.warning(
+            "Requested vector dimension %s differs from configured %s; using configured value.",
+            target_dim,
+            expected_dim,
+        )
+        target_dim = expected_dim
+
+    logger.info(
+        "Ensuring Qdrant collection '%s' (alias '%s') with vector dim %d",
+        physical,
+        alias,
+        target_dim,
+    )
 
     # Ensure the physical collection exists.
     if not client.collection_exists(physical):
         client.recreate_collection(
             physical,
-            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            vectors_config=VectorParams(size=target_dim, distance=Distance.COSINE),
         )
 
-    # If alias equals physical, do nothing (prevents warnings on older clients)
+    # If alias equals physical, just use the physical name.
     if alias == physical:
+        _ALIAS_ENABLED = False
         return
 
-    # Otherwise try to map alias -> physical with version-safe fallbacks (do not crash)
+    # Attempt to ensure alias points to the physical collection.
     try:
-        if hasattr(client, "update_aliases"):
-            from qdrant_client.http.models import AliasOperations, CreateAlias
-            client.update_aliases(
-                change_aliases_operations=[AliasOperations.create_alias(
-                    CreateAlias(alias_name=alias, collection_name=physical)
-                )],
+        aliases = {
+            a.alias_name: a.collection_name
+            for a in client.get_aliases().aliases
+        }
+        if aliases.get(alias) != physical:
+            operations = []
+            if alias in aliases:
+                operations.append(
+                    models.DeleteAliasOperation(
+                        delete_alias=models.DeleteAlias(alias_name=alias)
+                    )
+                )
+            operations.append(
+                models.CreateAliasOperation(
+                    create_alias=models.CreateAlias(
+                        alias_name=alias,
+                        collection_name=physical,
+                    )
+                )
+            )
+            client.update_collection_aliases(
+                change_aliases_operations=[
+                    models.ChangeAliasesOperation(actions=operations)
+                ],
                 timeout=30,
             )
-        elif hasattr(client, "create_alias"):
-            try:
-                client.create_alias(collection_name=physical, alias_name=alias)
-            except Exception:
-                if hasattr(client, "delete_alias"):
-                    client.delete_alias(alias_name=alias)
-                    client.create_alias(collection_name=physical, alias_name=alias)
-    except Exception:
-        # Non-fatal; we'll still use the physical name.
-        pass
+        _ALIAS_ENABLED = True
+    except Exception as exc:
+        logger.warning("Alias configuration failed; falling back to physical collection: %s", exc)
+        _ALIAS_ENABLED = False
 
 
 def _safe_filter(f):
@@ -353,3 +397,20 @@ def points_count(client: QdrantClient) -> int:
     except Exception:
         info = client.get_collection(name)
         return getattr(info, "points_count", 0) or 0
+
+
+def ensure_alias(client: QdrantClient) -> None:
+    """
+    Ensure the configured alias points to the desired collection.
+    Safe to call during startup; failures only emit a warning.
+    """
+    try:
+        ensure_collection(client)
+    except Exception as exc:
+        logger.warning("Alias ensure skipped due to error: %s", exc)
+
+
+
+def get_active_collection() -> str:
+    """Return the alias name used as the active collection entry point."""
+    return _alias_name() if _ALIAS_ENABLED else _physical_name()

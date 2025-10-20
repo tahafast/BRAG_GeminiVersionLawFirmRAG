@@ -5,11 +5,11 @@ Consolidated configuration settings and service wiring for the Law Firm Chatbot
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Callable, List, Any
 from pydantic_settings import BaseSettings
 from fastapi import FastAPI, Request
-from openai import AsyncOpenAI
 from qdrant_client import QdrantClient
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -49,16 +49,15 @@ class Settings(BaseSettings):
     QDRANT_PORT: int = 6333
     LOG_QDRANT_HTTP: str = "0"
     
-    # LLM
-    LLM_PROVIDER: str = "openai"
-    LLM_MODEL: str = "gpt-5-mini"
-    LLM_MODEL_FALLBACK: str | None = None
-    OPENAI_API_KEY: str | None = None
-    AZURE_OPENAI_API_KEY: str | None = None
-    AZURE_OPENAI_ENDPOINT: str | None = None
-    AZURE_OPENAI_DEPLOYMENT: str | None = None
-    ANTHROPIC_API_KEY: str | None = None
+    # LLM (Gemini-focused configuration)
+    LLM_PROVIDER: str = "gemini"
+    LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_MODEL_FALLBACK: str = "gemini-2.5-flash"
+    LLM_MODEL_GEMINI_FAST: str = "gemini-2.5-flash"
+    LLM_MODEL_GEMINI_HEAVY: str = "gemini-2.5-flash"
+    GEMINI_API_KEY: str | None = None
     GOOGLE_API_KEY: str | None = None
+    ANTHROPIC_API_KEY: str | None = None
     
     # LLM Behavior Settings (optimized for speed and quality)
     LLM_TEMPERATURE_DEFAULT: float = 0.3
@@ -69,13 +68,6 @@ class Settings(BaseSettings):
     LLM_PRESENCE_PENALTY: float = 0.1
     LLM_FREQUENCY_PENALTY: float = 0.1
     
-    # OpenAI Configuration
-    OPENAI_CHAT_MODEL: str = "gpt-4o-mini"  # Fast, high-quality, no reasoning tokens
-    OPENAI_MAX_TOKENS: int = 2000  # Increased for detailed, comprehensive responses
-    OPENAI_TEMPERATURE: float = 0.3  # Lower for consistency, reduce hallucination
-    OPENAI_TOP_P: float = 1.0
-    OPENAI_TIMEOUT_SECS: int = 30  # Increased for longer, detailed responses
-    
     # Qdrant Configuration (optimized for fast, high-quality retrieval)
     QDRANT_SEARCH_TIMEOUT_SECS: int = 2  # Tight timeout for faster responses
     QDRANT_TOP_K_DEFAULT: int = 6  # Focused retrieval: 6 high-quality chunks
@@ -83,7 +75,7 @@ class Settings(BaseSettings):
     QDRANT_SCORE_THRESHOLD: float = 0.40  # Lowered to include more relevant chunks (was 0.55, too strict)
     
     # Embeddings Configuration
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    EMBEDDING_MODEL: str = "text-embedding-004"
     
     # RAG Debug Configuration
     DEBUG_RAG: bool = False  # Enable detailed RAG pipeline logging (set to True for debugging)
@@ -131,21 +123,53 @@ def get_qdrant_client() -> QdrantClient:
         )
 
 
-def get_embedder() -> AsyncOpenAI:
-    """Create embeddings client based on LLM configuration."""
-    return AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        timeout=120.0,
-        max_retries=3
-    )
+def get_embedder():
+    """
+    Returns an embedding function compatible with Gemini embeddings.
+    Replaces AsyncOpenAI from the old version.
+    """
+    provider = os.getenv("EMBEDDING_PROVIDER", settings.LLM_PROVIDER or "gemini")
+    if provider.lower() == "gemini":
+        gemini_key = os.getenv("GEMINI_API_KEY") or settings.GEMINI_API_KEY or settings.GOOGLE_API_KEY
+        model = os.getenv("EMBEDDING_MODEL", settings.EMBEDDING_MODEL)
+
+        def embed_text(text: str):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={gemini_key}"
+            payload = {"model": model, "content": {"parts": [{"text": text}]}}
+            try:
+                res = requests.post(url, json=payload)
+                res.raise_for_status()
+                data = res.json()
+                return data.get("embedding", {}).get("values", [])
+            except Exception as e:
+                print(f"⚠️ Gemini embedding error: {e}")
+                return []
+
+        return embed_text
+    else:
+        raise ValueError(f"Unknown EMBEDDING_PROVIDER: {provider}")
 
 
-def get_llm_client() -> AsyncOpenAI:
-    """Create LLM client based on LLM configuration."""
-    return AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        timeout=settings.OPENAI_TIMEOUT_SECS
-    )
+def get_llm_client() -> Optional[Any]:
+    """
+    Legacy hook for older code paths expecting an AsyncOpenAI client.
+    Gemini routes interact via dedicated service modules, so we return None by default.
+    """
+    provider = (os.getenv("LLM_PROVIDER") or settings.LLM_PROVIDER or "").strip().lower()
+
+    if provider == "openai":
+        from openai import AsyncOpenAI
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER is set to 'openai'")
+        timeout = float(os.getenv("OPENAI_TIMEOUT_SECS", "30"))
+        return AsyncOpenAI(
+            api_key=api_key,
+            timeout=timeout
+        )
+
+    return None
 
 
 def wire_services(app: FastAPI) -> None:
@@ -198,7 +222,12 @@ async def perform_warmup(app: FastAPI) -> None:
 class Services:
     """Legacy Services container for backward compatibility."""
     
-    def __init__(self, qdrant_client: QdrantClient, embed_client: AsyncOpenAI, llm_client: AsyncOpenAI):
+    def __init__(
+        self,
+        qdrant_client: QdrantClient,
+        embed_client: Callable[[str], List[float]],
+        llm_client: Optional[Any],
+    ):
         self.qdrant_client = qdrant_client
         self.embed_client = embed_client
         self.llm_client = llm_client

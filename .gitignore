@@ -29,6 +29,7 @@ Dockerfile
 
 # Documentation files (MD files)
 *.md
+!README.md
 
 # Database files
 *.sqlite
@@ -42,4 +43,12 @@ Dockerfile
 # Check/utility scripts
 check_db.py
 scripts/
+
+# Logs
+logs/
+
+# Tests
+tests/
+test_*.py
+*_test.py
 

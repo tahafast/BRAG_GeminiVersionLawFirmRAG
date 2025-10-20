@@ -5,6 +5,8 @@ from datetime import datetime
 import logging
 import os
 import re
+import time
+import anyio
 
 from app.modules.lawfirmchatbot.services.ingestion.document_processor import process_document
 from app.modules.lawfirmchatbot.services.retrieval.vector_search import add_documents_to_vector_store, search_similar_documents, normalize_hits, build_user_prompt
@@ -27,9 +29,19 @@ from app.modules.lawfirmchatbot.services.conversation_state import (
     record_response,
 )
 from app.modules.lawfirmchatbot.services.document_service import render_html_document, extract_case_info
+from app.modules.lawfirmchatbot.services.vector_store import get_qdrant_client, get_active_collection
+from app.modules.lawfirmchatbot.services.embeddings import get_embeddings
+from app.modules.lawfirmchatbot.services.rag.llm import generate_llm_response
+from app.modules.lawfirmchatbot.services.rag import RAG_TOP_K, RAG_MIN_SCORE
 from app.services.LLM.config import get_llm_settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("RAGLogger")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("🧩 [%(asctime)s] [%(levelname)s] %(message)s", "%H:%M:%S")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # Initialize LLM config for routing
 LLM = get_llm_settings()
@@ -43,14 +55,31 @@ DOCGEN_KEYWORDS = [
 ]
 
 TWEAK_KEYWORDS = [
-    "tweak", "revise", "modify", "simplify", "edit", "tone",
-    "change", "update", "add", "remove", "replace"
+    "tweak", "update", "change", "replace", "edit", "modify", "fix",
+    "correct", "revise", "amend", "adjust", "insert", "remove", "delete",
+    "set", "fill", "add the", "add date", "add address", "replace the",
+    # existing tweak signals
+    "simplify", "tone", "add"
 ]
 
 FOLLOWUP_KEYWORDS = [
     "continue", "carry on", "from above", "use above", "same info", "same details",
     "as before", "as discussed", "earlier", "previous response", "next part",
     "keep going", "follow up", "add to that"
+]
+
+# Minimal/skeleton docgen triggers
+SKELETON_TRIGGERS = [
+    "skeleton", "template", "blank format", "format only",
+    "format", "proforma", "specimen",
+    "use placeholders", "placeholders wherever", "just a skeleton"
+]
+
+# "Use above" instruction triggers
+USE_ABOVE_TRIGGERS = [
+    "use details above", "use the details above",
+    "use details provided above", "use the above info",
+    "use info above only", "use above only"
 ]
 
 def _looks_like_docgen(q: str) -> bool:
@@ -81,6 +110,67 @@ def _is_tweak_request(query: str) -> bool:
 def _is_followup_request(query: str) -> bool:
     text = (query or "").lower()
     return any(kw in text for kw in FOLLOWUP_KEYWORDS)
+
+
+def _looks_like_tweak(q: str) -> bool:
+    """Heuristic check if user text looks like a tweak/update instruction."""
+    return _is_tweak_request(q)
+
+
+def _has_recent_doc_msg(history: Optional[List[dict]] | None) -> bool:
+    """Heuristic: last assistant message(s) contain document HTML or strong legal markers."""
+    if not history:
+        return False
+    recent = list(reversed(history[-5:]))
+    for msg in recent:
+        if (msg or {}).get("role") != "assistant":
+            continue
+        c = (msg.get("content") or "")
+        lc = c.lower()
+        if (
+            "<html" in lc or "<body" in lc or
+            "class='legal-doc'" in lc or 'class="legal-doc"' in lc or
+            "legal notice" in lc or "in the court" in lc or "affidavit" in lc or
+            "petition" in lc or "rejoinder" in lc or "synopsis" in lc or "plaint" in lc
+        ):
+            return True
+    return False
+
+
+def _messages_to_prompt(messages: List[dict]) -> str:
+    """Flatten chat messages into a plain-text prompt."""
+    parts: List[str] = []
+    for msg in messages or []:
+        role = (msg.get("role") or "user").upper()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        parts.append(f"{role}:\n{content}")
+    return "\n\n".join(parts)
+
+
+def _looks_like_minimal_docgen(q: str) -> bool:
+    """Detect minimal/skeleton docgen intents (e.g., templates or party-between phrasing)."""
+    t = (q or "").lower()
+    # explicit skeleton/template cues
+    if any(k in t for k in SKELETON_TRIGGERS):
+        return True
+    # more permissive: allow "draft me a|the| * suit ... between ... and ..."
+    # - anything can appear between 'draft' and document type (e.g., 'me a')
+    # - tolerate extra words and punctuation
+    if re.search(
+        r"\bdraft\b.*?\b(suit|petition|affidavit|legal\s+notice)\b.*?\bbetween\b.+?\band\b.+",
+        t,
+        flags=re.DOTALL,
+    ):
+        return True
+    return False
+
+
+def _mentions_use_above(q: str) -> bool:
+    """Detect requests to reuse previously provided details without re-asking."""
+    t = (q or "").lower()
+    return any(k in t for k in USE_ABOVE_TRIGGERS)
 
 
 def detect_mode(user_query: str, cache=None) -> str:
@@ -118,7 +208,10 @@ def should_use_retriever(mode: str, user_query: str) -> bool:
         return True
 
     if mode == "general":
-        keywords = ["law", "act", "article", "section", "ordinance", "precedent"]
+        keywords = [
+            "law", "act", "article", "section", "ordinance", "precedent",
+            "case law", "citation"
+        ]
         return any(k in text for k in keywords)
 
     return False
@@ -681,20 +774,76 @@ INSTRUCTIONS - Follow BRAG AI Rich Markdown format:
             # Pull recent turns for resolver + prompt
             recent_msgs = await self.memory.get_prompt_messages(db, conversation_id, recent_pairs=5)
             
-            # NEW: Resolve pronouns / ellipses using recent history
-            resolved_query = await resolve_coref(recent_msgs, query)
+            # --- Early routing: decide mode + placeholders BEFORE coref ---
+            placeholders = False
+            skip_coref = False
+            early_mode = "general"
+            try:
+                if _looks_like_tweak(query) and _has_recent_doc_msg(recent_msgs):
+                    early_mode = "tweak_doc"
+                    skip_coref = True
+                elif _looks_like_minimal_docgen(query) or _mentions_use_above(query) or _looks_like_docgen(query):
+                    early_mode = "docgen"
+                    if _looks_like_minimal_docgen(query) or _mentions_use_above(query):
+                        placeholders = True
+                        # Avoid coref rewriting "use above" into prose
+                        skip_coref = True
+                else:
+                    early_mode = "general"
+            except Exception:
+                early_mode = "general"
+                skip_coref = False
+
+            # Safety net: upgrade to placeholders for explicit format/proforma/specimen phrasing
+            if early_mode == "docgen" and not placeholders:
+                ql = (query or "").lower()
+                if any(k in ql for k in ["format", "proforma", "specimen"]):
+                    placeholders = True
+                    skip_coref = True
+                    logger.info("[routing] upgraded to placeholders due to 'format/proforma/specimen'")
+
+            logger.info(f"[routing] mode={early_mode} placeholders={placeholders}")
+
+            # Resolve pronouns / ellipses using recent history unless guarded
+            if not skip_coref:
+                resolved_query = await resolve_coref(recent_msgs, query)
+                if resolved_query != query:
+                    logger.info(f"[coref] Resolved '{query[:60]}...' -> '{resolved_query[:60]}...'")
+            else:
+                resolved_query = query
+                logger.info("[coref] Skipped for tweak/minimal flow")
             
             # Use resolved query for retrieval
-            if resolved_query != query:
-                logger.info(f"[coref] Resolved '{query[:50]}...' -> '{resolved_query[:50]}...'")
             
             await db.commit()
-        
+
+        # --- Explicit DocGen detection (force-mode precheck) ---
+        # Ensure _looks_like_docgen() runs on every query, using the resolved query
+        # so we don't miss intent due to pronouns/ellipsis in the raw text.
+        forced_mode = None
+        try:
+            if _looks_like_docgen(resolved_query):
+                logger.info(f"[DocGen] Force-mode detected: {resolved_query}")
+                forced_mode = "docgen"
+            else:
+                forced_mode = None
+        except Exception:
+            # Safe guard: never block on detection issues
+            forced_mode = None
+
         # RAG-DEBUG: Comprehensive query logging
         if settings.DEBUG_RAG:
             logger.info(f"[RAG-DEBUG] Starting answer_query: query='{query[:150]}...' (length={len(query)}), conversation_id={conversation_id}")
         state_cache = await get_conversation_state(conversation_id)
         detected_mode_label = detect_mode(resolved_query, state_cache)
+        # Honor early tweak/docgen routing decisions
+        if early_mode == "tweak_doc":
+            detected_mode_label = "tweak_doc"
+        elif early_mode == "docgen" and detected_mode_label != "tweak_doc":
+            detected_mode_label = "docgen"
+        # If explicit docgen is detected, honor it unless we're in a tweak flow
+        if forced_mode == "docgen" and detected_mode_label != "tweak_doc":
+            detected_mode_label = "docgen"
 
         if detected_mode_label == "tweak_doc" and state_cache.last_document:
             logger.info(f"[DocGen] Tweak request detected; reusing last document (doc_type={state_cache.last_doc_type})")
@@ -723,42 +872,56 @@ INSTRUCTIONS - Follow BRAG AI Rich Markdown format:
             user_prompt_parts.append(instruction_block)
             user_prompt = "\n\n".join(user_prompt_parts)
 
-            from app.modules.lawfirmchatbot.services.llm import _get_client
-            openai_client = _get_client()
-            model_doc = os.getenv("DOCGEN_MODEL", "gpt-4o")
+            provider_name = (os.getenv("LLM_PROVIDER") or settings.LLM_PROVIDER or "gemini").strip().lower()
 
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ]
 
-            response = await chat_completion(
-                client=openai_client,
-                model=model_doc,
-                messages=messages,
-                intent="docgen",
-                temperature=0.2,
-                stream=False,
-                extra_params={"max_tokens": 2000},
-            )
-
-            if hasattr(response, "choices"):
-                revised_html = response.choices[0].message.content or ""
-            elif hasattr(response, "output_text"):
-                revised_html = response.output_text or ""
-            elif hasattr(response, "output"):
-                if isinstance(response.output, list):
-                    chunks = []
-                    for item in response.output:
-                        if hasattr(item, "type") and item.type == "output_text":
-                            chunks.append(getattr(item, "text", ""))
-                        elif hasattr(item, "content"):
-                            chunks.append(item.content)
-                    revised_html = "\n".join(chunks).strip()
-                else:
-                    revised_html = str(response.output) if response.output else ""
+            if provider_name == "gemini":
+                prompt = (
+                    (system_prompt or "").strip()
+                    + "\n\nUSER INSTRUCTION:\n"
+                    + (user_prompt or "").strip()
+                )
+                revised_html = await anyio.to_thread.run_sync(
+                    generate_llm_response, prompt, "docgen"
+                )
+                revised_html = revised_html.strip()
             else:
-                revised_html = ""
+                from app.modules.lawfirmchatbot.services.llm import _get_client
+
+                openai_client = _get_client()
+                model_doc = os.getenv("DOCGEN_MODEL", "gpt-4o")
+
+                response = await chat_completion(
+                    client=openai_client,
+                    model=model_doc,
+                    messages=messages,
+                    intent="docgen",
+                    temperature=0.2,
+                    stream=False,
+                    extra_params={"max_tokens": 2000},
+                )
+
+                if hasattr(response, "choices"):
+                    revised_html = response.choices[0].message.content or ""
+                elif hasattr(response, "output_text"):
+                    revised_html = response.output_text or ""
+                elif hasattr(response, "output"):
+                    if isinstance(response.output, list):
+                        chunks = []
+                        for item in response.output:
+                            if hasattr(item, "type") and item.type == "output_text":
+                                chunks.append(getattr(item, "text", ""))
+                            elif hasattr(item, "content"):
+                                chunks.append(item.content)
+                        revised_html = "\n".join(chunks).strip()
+                    else:
+                        revised_html = str(response.output) if response.output else ""
+                else:
+                    revised_html = ""
 
             if revised_html.startswith("```"):
                 first_newline = revised_html.find("\n")
@@ -818,7 +981,10 @@ INSTRUCTIONS - Follow BRAG AI Rich Markdown format:
             state_cache.doc_fields = docgen_context_fields
             filled_count = sum(1 for v in docgen_context_fields.values() if v)
 
-            if filled_count < 3:
+            provider_name = (os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
+            skip_missing_prompt = provider_name == "gemini" or ('placeholders' in locals() and placeholders)
+
+            if filled_count < 3 and not skip_missing_prompt:
                 missing_fields = [k for k, v in docgen_context_fields.items() if not v]
                 missing_list = ", ".join(field.replace("_", " ") for field in missing_fields) or "additional case details"
                 ask_text = f"To draft your document, please provide the following missing details: {missing_list}."
@@ -884,6 +1050,7 @@ Ask specific questions about your documents, request comparisons between concept
         # === INTELLIGENT ROUTING: Detect mode (QA vs DocGen) ===
         is_docgen = detected_mode_label == "docgen"
         mode = "docgen" if is_docgen else "qa"
+        logger.info(f"[routing] mode={mode}")
         
         # Retrieval sizing based on mode
         if is_docgen:
@@ -897,7 +1064,27 @@ Ask specific questions about your documents, request comparisons between concept
             logger.info(f"[RAG-DEBUG] Mode detected: {mode}, top_k={k}, score_threshold={score_thresh}")
         
         # Retrieve more candidates for strategy decision (use resolved query)
-        use_retriever = should_use_retriever(detected_mode_label, resolved_query)
+        # ============================================================
+        # 🔧 Updated Gemini RAG routing logic
+        # ============================================================
+        # Default: disable retriever for small talk only
+        if mode == "docgen" and 'placeholders' in locals() and placeholders:
+            use_retriever = False
+        else:
+            use_retriever = False
+            if mode in ["docgen", "draft", "petition", "qa", "research", "case", "contextual"]:
+                use_retriever = True
+
+            # ✅ Safety: ensure Qdrant alias exists before enabling
+            try:
+                from core.config import settings
+                if not getattr(settings, "QDRANT_COLLECTION_ALIAS", None):
+                    use_retriever = False
+                    logger.warning("[routing] Retriever disabled — missing Qdrant alias.")
+            except Exception as e:
+                logger.warning(f"[routing] Retriever safety check failed: {e}")
+
+        logger.info(f"[routing] use_retriever={use_retriever}")
         initial_chunks = []
         total_hits = 0
         strong_hits = 0
@@ -1106,6 +1293,10 @@ Ask specific questions about your documents, request comparisons between concept
         # === MODE-AWARE PROMPTING AND MODEL SELECTION ===
         model_general = os.getenv("GENERAL_MODEL", "gpt-4o-mini")
         model_doc = os.getenv("DOCGEN_MODEL", "gpt-4o")
+        provider_name = (os.getenv("LLM_PROVIDER") or settings.LLM_PROVIDER or "gemini").strip().lower()
+        if provider_name == "gemini":
+            model_general = os.getenv("LLM_MODEL_GEMINI_FAST", getattr(settings, "LLM_MODEL_GEMINI_FAST", "gemini-2.5-flash"))
+            model_doc = os.getenv("LLM_MODEL_GEMINI_HEAVY", getattr(settings, "LLM_MODEL_GEMINI_HEAVY", "gemini-2.5-pro"))
         detected_doc_type: Optional[str] = None
         references_list: List[str] = []
         raw_markdown = ""
@@ -1116,12 +1307,26 @@ Ask specific questions about your documents, request comparisons between concept
         temperature = 0.2
         use_stream = True
 
-        from app.modules.lawfirmchatbot.services.llm import _get_client
-        openai_client = _get_client()
+        openai_client = None
+        if provider_name != "gemini":
+            from app.modules.lawfirmchatbot.services.llm import _get_client
+            openai_client = _get_client()
 
         if mode == "docgen":
             detected_doc_type = detect_doc_type(resolved_query)
             system_prompt = get_docgen_prompt(detected_doc_type)
+            if 'placeholders' in locals() and placeholders:
+                system_prompt += (
+                    " Emphasize producing a minimal skeleton/template with [PLACEHOLDER] for unknown fields;"
+                    " avoid narrative expansion and keep content concise."
+                )
+                system_prompt += (
+                    "\n\n"
+                    "If any required detail is missing, DO NOT ask questions. "
+                    "Generate the full Pakistan-court-formatted HTML document and insert clear placeholders "
+                    "in square brackets, e.g., [CASE NUMBER], [COURT], [DATE], [PLAINTIFF ADDRESS]. "
+                    "Preserve the same HTML layout you normally produce."
+                )
             docgen_answers = {"user_request": resolved_query}
             if docgen_context_fields:
                 docgen_answers.update({k: v for k, v in docgen_context_fields.items() if v})
@@ -1143,7 +1348,12 @@ Ask specific questions about your documents, request comparisons between concept
                     continue
                 seen_refs.add(label)
                 references_list.append(label)
-            user_prompt = build_docgen_prompt(resolved_query, docgen_answers, final_chunks)
+            user_prompt = build_docgen_prompt(
+                resolved_query,
+                docgen_answers,
+                final_chunks,
+                use_placeholders=(placeholders if 'placeholders' in locals() else False),
+            )
             history_messages = [
                 msg for msg in (recent_msgs or [])
                 if msg.get("role") in ("user", "assistant")
@@ -1202,35 +1412,47 @@ OUTPUT RULES:
                 logger.info(f"[RAG-DEBUG] System prompt preview: {messages[0]['content'][:200]}...")
                 logger.info(f"[RAG-DEBUG] User prompt preview: {messages[-1]['content'][:500]}...")
 
+        logger.info(f"[routing] model={target_model}, intent={intent_label}")
         t_llm_start = time.time()
-        raw_response = await chat_completion(
-            client=openai_client,
-            model=target_model,
-            messages=messages,
-            intent=intent_label,
-            temperature=temperature,
-            stream=use_stream,
-            extra_params=extra_llm_params,
-        )
-        t_llm_first = time.time() - t_llm_start
 
-        if hasattr(raw_response, "choices"):
-            raw_markdown = raw_response.choices[0].message.content or ""
-        elif hasattr(raw_response, "output_text"):
-            raw_markdown = raw_response.output_text or ""
-        elif hasattr(raw_response, "output"):
-            if isinstance(raw_response.output, list):
-                chunks = []
-                for item in raw_response.output:
-                    if hasattr(item, "type") and item.type == "output_text":
-                        chunks.append(getattr(item, "text", ""))
-                    elif hasattr(item, "content"):
-                        chunks.append(item.content)
-                raw_markdown = "\n".join(chunks).strip()
-            else:
-                raw_markdown = str(raw_response.output) if raw_response.output else ""
+        if provider_name == "gemini":
+            prompt = _messages_to_prompt(messages)
+            raw_markdown = await anyio.to_thread.run_sync(
+                generate_llm_response,
+                prompt,
+                "docgen" if intent_label == "docgen" else "qa",
+            )
+            raw_markdown = (raw_markdown or "").strip()
+            t_llm_first = time.time() - t_llm_start
         else:
-            raw_markdown = ""
+            raw_response = await chat_completion(
+                client=openai_client,
+                model=target_model,
+                messages=messages,
+                intent=intent_label,
+                temperature=temperature,
+                stream=use_stream,
+                extra_params=extra_llm_params,
+            )
+            t_llm_first = time.time() - t_llm_start
+
+            if hasattr(raw_response, "choices"):
+                raw_markdown = raw_response.choices[0].message.content or ""
+            elif hasattr(raw_response, "output_text"):
+                raw_markdown = raw_response.output_text or ""
+            elif hasattr(raw_response, "output"):
+                if isinstance(raw_response.output, list):
+                    chunks = []
+                    for item in raw_response.output:
+                        if hasattr(item, "type") and item.type == "output_text":
+                            chunks.append(getattr(item, "text", ""))
+                        elif hasattr(item, "content"):
+                            chunks.append(item.content)
+                    raw_markdown = "\n".join(chunks).strip()
+                else:
+                    raw_markdown = str(raw_response.output) if raw_response.output else ""
+            else:
+                raw_markdown = ""
 
         if settings.DEBUG_RAG:
             estimated_tokens = len(raw_markdown) // 4
@@ -1328,8 +1550,108 @@ OUTPUT RULES:
                 "conversation_id": conversation_id,
                 "response_type": "html" if mode == "docgen" else "text",
                 "has_doc": mode == "docgen",
+                "use_placeholders": (placeholders if 'placeholders' in locals() else False),
             }
         }
+
+
+def _legacy_run_rag_query(user_query: str, task_type: str = "qa") -> str:
+    """
+    Executes a full RAG pipeline with structured logging.
+    Preserves the existing business logic for both QA and DocGen workflows.
+    """
+    client = get_qdrant_client()
+    collection_name = get_active_collection()
+
+    vectors = get_embeddings([user_query])
+    if not vectors or not vectors[0]:
+        return "⚠️ Unable to generate embeddings for the query."
+    query_vector = vectors[0]
+
+    search_results = client.search(
+        collection_name=collection_name,
+        query_vector=query_vector,
+        limit=RAG_TOP_K,
+        score_threshold=RAG_MIN_SCORE
+    )
+
+    if not search_results:
+        return "⚠️ No relevant context found for this query."
+
+    context_chunks = [
+        hit.payload.get("text", "")
+        for hit in search_results
+        if isinstance(hit.payload, dict) and "text" in hit.payload
+    ]
+    context = "\n\n".join(chunk for chunk in context_chunks[:RAG_TOP_K] if chunk)
+
+    prompt = (
+        "Below is the contextual information retrieved from your case documents:\n\n"
+        f"{context}\n\n"
+        "Now, based on this information, respond to the following user query:\n\n"
+        f"{user_query}\n\n"
+        "Your response should be concise, factual, and legally appropriate."
+    )
+
+    return generate_llm_response(prompt, task_type)
+
+
+def run_rag_query(user_query: str, task_type: str = "qa") -> str:
+    """
+    Executes a full RAG pipeline with structured logging.
+    Preserves the existing business logic for both QA and DocGen workflows.
+    """
+    logger.info(f"🔍 New query — Type: {task_type.upper()} | Text: {user_query[:80]}...")
+    start_time = time.time()
+
+    try:
+        client = get_qdrant_client()
+        collection_name = get_active_collection()
+
+        # Step 1: Embeddings
+        t0 = time.time()
+        vectors = get_embeddings([user_query])
+        if not vectors or not vectors[0]:
+            logger.warning("⚠️ Unable to generate embeddings for the query.")
+            return "⚠️ Unable to generate embeddings for the query."
+        query_vector = vectors[0]
+        logger.info(f"✅ Embedding generated (dim={len(query_vector)}) in {time.time()-t0:.2f}s")
+
+        # Step 2: Retrieval
+        t1 = time.time()
+        search_results = client.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            limit=RAG_TOP_K,
+            score_threshold=RAG_MIN_SCORE,
+        )
+        logger.info(f"✅ Retrieved {len(search_results)} documents in {time.time()-t1:.2f}s")
+
+        if not search_results:
+            logger.warning("⚠️ No matching documents found.")
+            return "⚠️ No relevant context found for this query."
+
+        # Step 3: Combine context
+        context_chunks = [hit.payload.get("text", "") for hit in search_results if "text" in hit.payload]
+        context = "\n\n".join(context_chunks[:RAG_TOP_K])
+        logger.info(f"📄 Context length: {len(context)} chars")
+
+        # Step 4: LLM Generation
+        prompt = (
+            "Use the following legal context to respond accurately:\n\n"
+            f"{context}\n\n"
+            f"User query:\n{user_query}\n\n"
+            "Respond as a professional legal assistant, maintaining factual accuracy."
+        )
+
+        t2 = time.time()
+        response = generate_llm_response(prompt, task_type)
+        logger.info(f"🧠 LLM response generated in {time.time()-t2:.2f}s | Total RAG time: {time.time()-start_time:.2f}s")
+        return response
+
+    except Exception as e:
+        logger.exception(f"❌ RAG pipeline error: {e}")
+        return f"[RAG Error] {str(e)}"
 
 
 # Global orchestrator instance

@@ -7,6 +7,7 @@ consistent across call sites.
 """
 
 from typing import Optional
+import os
 from core.config import settings
 
 
@@ -24,12 +25,12 @@ class LLMConfig:
         self.docgen_max_tokens: int = int(getattr(settings, "DOCGEN_MAX_TOKENS", 3000))
         
         # OpenAI Configuration
-        self.openai_api_key: Optional[str] = settings.OPENAI_API_KEY
+        self.openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
         
         # Azure OpenAI Configuration
-        self.azure_api_key: Optional[str] = settings.AZURE_OPENAI_API_KEY
-        self.azure_endpoint: Optional[str] = settings.AZURE_OPENAI_ENDPOINT
-        self.azure_deployment: Optional[str] = settings.AZURE_OPENAI_DEPLOYMENT
+        self.azure_api_key: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
+        self.azure_endpoint: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
+        self.azure_deployment: Optional[str] = os.getenv("AZURE_OPENAI_DEPLOYMENT")
         
         # Other LLM Providers
         self.anthropic_api_key: Optional[str] = settings.ANTHROPIC_API_KEY

@@ -151,7 +151,7 @@ async def process_document_upload(
 
         # Ensure collection exists before processing (fixes upload crash by passing client)
         from app.modules.lawfirmchatbot.services.vector_store import ensure_collection
-        ensure_collection(services.qdrant_client, dim=1536)
+        ensure_collection(services.qdrant_client)
         
         # Process document using RAG orchestrator
         from app.modules.lawfirmchatbot.services.rag.rag_orchestrator import get_rag_orchestrator

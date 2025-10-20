@@ -1,21 +1,30 @@
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import time
 import hashlib
-import httpx
 import logging
-import re
-from openai import AsyncOpenAI, BadRequestError
+import os
+import anyio
+import requests
+
 from core.config import settings
 from core.utils.perf import profile_stage
+from app.modules.lawfirmchatbot.services.embeddings import embed_text as provider_embed_text
 
 logger = logging.getLogger(__name__)
 
-_HTTPX = httpx.AsyncClient(timeout=6, limits=httpx.Limits(max_keepalive_connections=20, max_connections=40))
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+    or getattr(settings, "GOOGLE_API_KEY", None)
+)
+LLM_MODEL_GEMINI_FAST = getattr(settings, "LLM_MODEL_GEMINI_FAST", "gemini-2.5-flash")
+LLM_MODEL_GEMINI_HEAVY = getattr(settings, "LLM_MODEL_GEMINI_HEAVY", "gemini-2.5-flash")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+_GEMINI_TIMEOUT_SECS = float(os.getenv("GEMINI_TIMEOUT_SECS", "40"))
+
 _EMBED_CACHE: dict[str, tuple[float, list[float]]] = {}
 _EMBED_TTL = settings.EMBED_CACHE_TTL_S
 _EMBED_MAX = settings.EMBED_CACHE_MAX
-
-_client: AsyncOpenAI | None = None
 
 
 def _ekey(model: str, text: str) -> str:
@@ -26,7 +35,8 @@ def _ekey(model: str, text: str) -> str:
 def _embed_cache_get(model: str, text: str):
     key = _ekey(model, text)
     item = _EMBED_CACHE.get(key)
-    if not item: return None
+    if not item:
+        return None
     ts, vec = item
     if time.time() - ts > _EMBED_TTL:
         _EMBED_CACHE.pop(key, None)
@@ -40,79 +50,96 @@ def _embed_cache_put(model: str, text: str, vec: list[float]):
     _EMBED_CACHE[_ekey(model, text)] = (time.time(), vec)
 
 
-@profile_stage("embedding")
-async def embed_text_async(text: str) -> list[float]:
-    """Cached async embedding using persistent HTTP client."""
-    model = settings.EMBEDDING_MODEL
-    hit = _embed_cache_get(model, text)
-    if hit is not None:
-        return hit
-
-    # Use shared HTTP client for OpenAI API calls
-    import openai
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, http_client=_HTTPX)
-    res = await client.embeddings.create(
-        model=model, input=text
-    )
-    vec = res.data[0].embedding
-    _embed_cache_put(model, text, vec)
-    return vec
+def _format_messages_for_prompt(messages: List[Dict[str, str]]) -> str:
+    """Flatten chat messages into a plain prompt for Gemini's text endpoint."""
+    parts: List[str] = []
+    for msg in messages:
+        role = (msg.get("role") or "user").upper()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        parts.append(f"{role}:\n{content}")
+    return "\n\n".join(parts)
 
 
-def embed_text(text: str) -> list[float]:
-    import anyio
-    return anyio.run(embed_text_async, text)
+def _infer_task(messages: List[Dict[str, str]], explicit: Optional[str] = None) -> str:
+    """Lightweight inference of task type (qa | docgen)."""
+    if explicit:
+        return explicit
+
+    docgen_markers = ("docgen", "document", "draft", "petition", "affidavit", "legal notice")
+
+    system = (messages[0].get("content") or "").lower() if messages else ""
+    user = (messages[-1].get("content") or "").lower() if messages else ""
+
+    if any(marker in system for marker in docgen_markers) or any(marker in user for marker in docgen_markers):
+        return "docgen"
+    return "qa"
 
 
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, timeout=settings.OPENAI_TIMEOUT_SECS)
-    return _client
+def _select_model(task: str, override: Optional[str] = None) -> str:
+    if override:
+        return override
+    return LLM_MODEL_GEMINI_HEAVY if task == "docgen" else LLM_MODEL_GEMINI_FAST
 
 
-# ============================================================
-# Helper functions for dual-path LLM calling
-# ============================================================
-
-def _normalize_model(name: str) -> str:
-    """Normalize model name by removing spaces and lowercasing."""
-    return re.sub(r"\s+", "", (name or "")).lower()
-
-
-def _is_gpt5(model: str) -> bool:
-    """Check if model is GPT-5 (requires Responses API)."""
-    m = _normalize_model(model)
-    return m.startswith("gpt-5")
+def _build_generation_config(temperature: float, max_tokens: int) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    if temperature is not None:
+        config["temperature"] = float(max(0.0, min(temperature, 1.0)))
+    if max_tokens:
+        config["maxOutputTokens"] = int(max_tokens)
+    return config
 
 
-def _budgets_for(model: str, intent: str) -> Tuple[int, int]:
-    """
-    Returns (reasoning_budget, output_budget).
-    For GPT-5: uses Responses API with reasoning.
-    For 4o-mini: uses Chat Completions without reasoning.
-    """
-    if _is_gpt5(model):
-        # Doc-gen needs long output
-        if intent == "docgen":
-            return (1200, 5500)
-        return (600, 2000)
-    if intent == "docgen":
-        # Allow longer completions for structured documents when using chat-completions models
-        return (0, 2400)
-    # 4o-mini: no reasoning; we keep outputs modest
-    return (0, 850)
+def _gemini_generate(
+    model: str,
+    prompt: str,
+    intent: str = "general",
+    temperature: float = 0.3,
+    max_tokens: int = 800,
+) -> str:
+    """Send text prompt to Gemini API and return response text."""
+    if not GEMINI_API_KEY:
+        logger.error("❌ GEMINI_API_KEY missing; cannot generate text.")
+        return "⚠️ Gemini key missing; please configure environment."
 
+    url = f"{GEMINI_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
+    payload: Dict[str, Any] = {
+        "contents": [{"parts": [{"text": prompt}]}],
+    }
 
-def _strip_keys(d: Dict[str, Any], keys: tuple) -> Dict[str, Any]:
-    """Strip specified keys from dictionary."""
-    return {k: v for k, v in (d or {}).items() if k not in keys}
+    config = _build_generation_config(temperature, max_tokens)
+    if config:
+        payload["generationConfig"] = config
+
+    try:
+        resp = requests.post(url, json=payload, timeout=_GEMINI_TIMEOUT_SECS)
+        if resp.status_code == 429:
+            logger.warning("⚠️ Gemini 429 rate-limit, skipping generation.")
+            return "⚠️ Gemini temporarily overloaded. Please retry shortly."
+        resp.raise_for_status()
+        data = resp.json()
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+            .strip()
+        )
+        if not text:
+            logger.warning("⚠️ Gemini returned empty output for intent '%s'.", intent)
+            return "⚠️ No output from Gemini."
+        return text
+    except Exception as exc:
+        logger.error("⚠️ Gemini generation error: %s", exc)
+        return "⚠️ Gemini temporarily unavailable."
 
 
 def looks_like_citations_only(text: str) -> bool:
     """
     Check if response is citations-only without substantive content.
-    
+
     Returns True only if:
     - Response is empty or very short (<50 chars)
     - OR has citations but lacks substantive content
@@ -120,191 +147,107 @@ def looks_like_citations_only(text: str) -> bool:
     t = text.strip()
     if not t or len(t) < 50:
         return True
-    
+
     # Count actual content vs citations/references
-    lines = [line.strip() for line in t.split('\n') if line.strip()]
+    lines = [line.strip() for line in t.split("\n") if line.strip()]
     content_lines = 0
     citation_lines = 0
-    
+
     for line in lines:
         line_lower = line.lower()
         # Skip empty lines and pure formatting
-        if not line or line in ['---', '***', '']:
+        if not line or line in ["---", "***", ""]:
             continue
         # Count citation/reference lines
-        if (line_lower.startswith(('citations:', 'references:', '**references**', '## references', '[1]', '[2]', '[3]', '[4]', '[5]')) or
-            line_lower.startswith('reference pages:') or
-            line_lower.startswith('**reference pages**') or
-            (line_lower.startswith('[') and ']' in line_lower[:10])):
+        if (
+            line_lower.startswith(("citations:", "references:", "**references**", "## references", "[1]", "[2]", "[3]", "[4]", "[5]"))
+            or line_lower.startswith("reference pages:")
+            or line_lower.startswith("**reference pages**")
+            or (line_lower.startswith("[") and "]" in line_lower[:10])
+        ):
             citation_lines += 1
         # Count substantive content lines
-        elif len(line) > 15 and not line_lower.startswith(('[', 'page ', 'see ', '- [', '* [')):
+        elif len(line) > 15 and not line_lower.startswith(("[", "page ", "see ", "- [", "* [")):
             content_lines += 1
-    
+
     has_sufficient_content = content_lines >= 2 or (len(t) >= 100 and content_lines >= 1)
     is_citations_only = not has_sufficient_content and (citation_lines > 0 or len(t) < 100)
-    
+
     return is_citations_only
 
 
-# ============================================================
-# Unified chat_completion: Auto-routes GPT-5 → Responses, 4o-mini → Chat
-# ============================================================
+@profile_stage("embedding")
+async def embed_text_async(text: str) -> list[float]:
+    """Cached async embedding using Gemini-backed helper."""
+    model = settings.EMBEDDING_MODEL
+    hit = _embed_cache_get(model, text)
+    if hit is not None:
+        return hit
+
+    vec = await provider_embed_text(text)
+    if not vec:
+        raise RuntimeError("Embedding provider returned empty vector.")
+
+    _embed_cache_put(model, text, vec)
+    return vec
+
+
+def embed_text(text: str) -> list[float]:
+    return anyio.run(embed_text_async, text)
+
 
 async def chat_completion(
-    client,
-    model: str,
-    messages: list[dict],
-    intent: str = "general",       # "general" | "docgen"
-    temperature: Optional[float] = 0.2,
-    stream: bool = False,
-    extra_params: Optional[Dict[str, Any]] = None,
-):
+    messages: List[Dict[str, str]],
+    *,
+    task: Optional[str] = None,
+    is_legal_query: bool = False,
+    temperature: float = 0.3,
+    max_tokens: int = 800,
+    model: Optional[str] = None,
+) -> str:
     """
-    Unified LLM entry:
-      • 4o-mini  → Chat Completions (no 'reasoning')
-      • GPT-5    → Responses API (with 'reasoning' + 'max_output_tokens')
-    Also handles 'temperature' unsupported errors by retrying without it.
+    Gemini-native chat completion used by RAG, QA, and DocGen flows.
     """
-    extra_params = dict(extra_params or {})
-    model_norm = _normalize_model(model)
-    reasoning_budget, output_budget = _budgets_for(model, intent)
+    effective_task = _infer_task(messages, task)
+    if is_legal_query and effective_task != "docgen":
+        effective_task = "qa"
 
-    # --------------------------
-    # Path A: GPT-4o/GPT-5 → Use max_completion_tokens
-    # --------------------------
-    if _is_gpt5(model_norm) or model_norm.startswith("gpt-4o"):
-        params = {
-            "model": model,
-            "messages": messages,
-            "max_completion_tokens": output_budget,
-            "temperature": 0.2 if intent == "docgen" else 0.3,  # Lower temp for doc-gen consistency
-        }
-        
-        # Strip incompatible params
-        params.update(_strip_keys(extra_params, ("max_tokens", "reasoning", "modalities")))
+    prompt = _format_messages_for_prompt(messages)
+    selected_model = _select_model(effective_task, override=model)
 
-        if settings.DEBUG_RAG:
-            logger.info(f"[LLM] Chat Completions ({model}): intent={intent}, max_completion_tokens={output_budget}")
+    logger.info("[LLM] Gemini call | model=%s task=%s tokens<=%s", selected_model, effective_task, max_tokens)
 
-        return await client.chat.completions.create(**params)
+    response_text = await anyio.to_thread.run_sync(
+        _gemini_generate,
+        selected_model,
+        prompt,
+        effective_task,
+        temperature,
+        max_tokens,
+    )
+    return response_text.strip()
 
-    # ----------------------------------------
-    # Path B: 4o-mini → Chat Completions (fast)
-    # ----------------------------------------
-    params = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": output_budget,
-        "stream": stream,
-    }
-    # 4o-mini accepts temperature; keep it if provided
-    if temperature is not None:
-        params["temperature"] = temperature
-
-    # Never pass Responses-only params to Chat Completions
-    params.update(_strip_keys(extra_params, ("reasoning", "max_output_tokens")))
-
-    if settings.DEBUG_RAG:
-        logger.info(f"[LLM] Chat Completions: model={model}, intent={intent}, max_tokens={output_budget}")
-
-    try:
-        return await client.chat.completions.create(**params)
-    except BadRequestError as e:
-        # Some endpoints may forbid non-default temperature; retry without it
-        msg = str(e)
-        if "temperature" in msg and "unsupported" in msg.lower():
-            logger.warning(f"[LLM] 4o-mini rejected temperature, retrying without it")
-            params.pop("temperature", None)
-            return await client.chat.completions.create(**params)
-        raise
-
-
-# ============================================================
-# Legacy wrapper for backward compatibility
-# ============================================================
 
 @profile_stage("llm_response")
 async def run_llm_chat(system_prompt: str, user_message: str, history=None):
     """
-    Legacy wrapper for existing code.
-    Uses the existing ChatCompletion logic.
+    Backwards-compatible wrapper that routes all chat to Gemini.
     """
     messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages += history
     messages.append({"role": "user", "content": user_message})
 
-    client = _get_client()
-    import os
-    model_general = os.getenv("GENERAL_MODEL", "gpt-4o-mini")
-    
-    response = await chat_completion(
-        client=client,
-        model=model_general,
-        messages=messages,
-        intent="general",
-        temperature=0.6,
-        stream=False,
-        extra_params={"max_tokens": 900}
+    system_lower = (system_prompt or "").lower()
+    task_type = "docgen" if any(
+        marker in system_lower for marker in ("docgen", "document", "draft", "petition", "affidavit")
+    ) else "qa"
+
+    response_text = await chat_completion(
+        messages,
+        task=task_type,
+        is_legal_query=task_type != "qa",
+        temperature=0.4 if task_type == "docgen" else 0.3,
+        max_tokens=1200 if task_type == "docgen" else 700,
     )
-    
-    # Extract content from response
-    if hasattr(response, 'choices'):
-        # Chat Completions response
-        content = response.choices[0].message.content or ""
-    elif hasattr(response, 'output'):
-        # Responses API response
-        content = response.output[0].content if isinstance(response.output, list) else response.output
-    else:
-        content = ""
-    
-    return content.strip()
-
-
-async def responses_generate(
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    max_output_tokens: int = 2048,
-    extra_messages: Optional[List[Dict[str, str]]] = None,
-) -> str:
-    """
-    Lightweight helper for the Responses API (GPT-5 class models).
-    Returns concatenated output text.
-    """
-    client = _get_client()
-
-    prompt_messages: List[Dict[str, str]] = [
-        {"role": "system", "content": (system_prompt or "").strip()}
-    ]
-
-    for msg in extra_messages or []:
-        role = msg.get("role")
-        content = (msg.get("content") or "").strip()
-        if not role or not content:
-            continue
-        prompt_messages.append({"role": role, "content": content})
-
-    prompt_messages.append({"role": "user", "content": (user_prompt or "").strip()})
-
-    response = await client.responses.create(
-        model=model,
-        input=prompt_messages,
-        max_output_tokens=max_output_tokens,
-    )
-
-    if hasattr(response, "output_text") and response.output_text:
-        return response.output_text.strip()
-
-    output_chunks: List[str] = []
-    for item in getattr(response, "output", []) or []:
-        if hasattr(item, "content"):
-            output_chunks.append(str(item.content))
-        elif hasattr(item, "text"):
-            output_chunks.append(str(item.text))
-
-    if output_chunks:
-        return "\n".join(output_chunks).strip()
-
-    return ""
+    return response_text.strip()

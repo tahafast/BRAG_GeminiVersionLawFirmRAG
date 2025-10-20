@@ -1,207 +1,180 @@
-# Law Firm Chatbot
+# BRAG AI (Gemini Edition)
 
-An advanced RAG (Retrieval-Augmented Generation) system designed specifically for legal document analysis and querying. This chatbot provides intelligent legal analysis with document upload capabilities and smart query processing.
-
-## 🚀 Features
-
-- **Document Upload**: Support for PDF, DOCX, and TXT files
-- **Legal Query Analysis**: Advanced legal keyword detection and analysis
-- **Smart Response Generation**: Context-aware responses with confidence scoring
-- **Professional Legal Analysis**: Tailored for legal terminology and concepts
-- **Interactive API Documentation**: Built-in Swagger/OpenAPI docs
-- **Health Monitoring**: Real-time server health checks
-
-## 🛠️ Technology Stack
-
-- **Backend**: FastAPI (Python)
-- **Server**: Uvicorn ASGI server
-- **Document Processing**: Multi-format document support
-- **API Documentation**: Swagger/OpenAPI
-- **Virtual Environment**: Python venv
-
-## 📋 Prerequisites
-
-- Python 3.8 or higher
-- pip (Python package manager)
-- Windows/macOS/Linux
-
-## ⚡ Quick Start
-
-### 1. Clone the Repository
-```bash
-git clone <repository-url>
-cd lawfirmChatbot
-```
-
-### 2. Set Up Virtual Environment
-```bash
-# Create virtual environment
-python -m venv robi
-
-# Activate virtual environment
-# On Windows:
-.\robi\Scripts\activate.bat
-# On macOS/Linux:
-source robi/bin/activate
-```
-
-### 3. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Start the Server
-
-**Option 1: Using the Batch File (Windows - Recommended)**
-```bash
-.\start_chatbot.bat
-```
-
-**Option 2: Using Python Directly**
-```bash
-python working_server.py
-```
-
-**Option 3: Using Uvicorn**
-```bash
-uvicorn working_server:app --host 127.0.0.1 --port 8000 --reload
-```
-
-### 5. Access the Application
-
-Once the server is running, you can access:
-
-- **Main API**: http://127.0.0.1:8000
-- **Interactive API Docs**: http://127.0.0.1:8000/docs
-- **Health Check**: http://127.0.0.1:8000/health
-
-## 📚 API Endpoints
-
-### Core Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | Welcome message and API information |
-| GET | `/health` | Server health check |
-| GET | `/docs` | Interactive API documentation |
-
-### Document Management
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/upload-document` | Upload legal documents (PDF, DOCX, TXT) |
-| POST | `/api/v1/query` | Query uploaded documents with legal analysis |
-
-## 🔧 Usage Examples
-
-### Upload a Document
-```bash
-curl -X POST "http://127.0.0.1:8000/api/v1/upload-document" \
-     -H "Content-Type: multipart/form-data" \
-     -F "file=@your-legal-document.pdf"
-```
-
-### Query the Document
-```bash
-curl -X POST "http://127.0.0.1:8000/api/v1/query" \
-     -H "Content-Type: application/json" \
-     -d '{"query": "What are the main contractual obligations?"}'
-```
-
-## 📁 Project Structure
-
-```
-lawfirmChatbot/
-├── app/                          # Application modules
-│   ├── modules/
-│   │   ├── lawfirmchatbot/      # Core chatbot functionality
-│   │   ├── services/            # Business logic services
-│   │   └── router.py            # API routing
-├── core/                        # Core configuration
-├── database/                    # Database configurations
-├── robi/                       # Virtual environment
-├── working_server.py           # Main server application (ACTIVE)
-├── start_chatbot.bat          # Windows startup script (ACTIVE)
-├── requirements.txt           # Python dependencies
-├── README.md                  # This file
-└── main.py                   # Alternative server entry point
-```
-
-## 🧪 Testing the API
-
-### Using the Interactive Documentation
-1. Navigate to http://127.0.0.1:8000/docs
-2. Try the `/health` endpoint to verify the server is running
-3. Use the `/api/v1/upload-document` endpoint to upload a test document
-4. Use the `/api/v1/query` endpoint to ask questions about your document
-
-### Health Check
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-Expected response:
-```json
-{
-  "status": "healthy",
-  "server": "running",
-  "documents_uploaded": 0,
-  "ready": true
-}
-```
-
-## 🔍 Legal Analysis Features
-
-The chatbot provides specialized legal analysis including:
-
-- **Legal Keyword Detection**: Recognizes legal terminology and concepts
-- **Query Complexity Analysis**: Determines if queries are simple or complex
-- **Confidence Scoring**: Provides reliability estimates for responses
-- **Professional Recommendations**: Suggests consulting with legal counsel when appropriate
-- **Document Context**: Maintains context of uploaded legal documents
-
-## 🚨 Troubleshooting
-
-### Server Won't Start
-1. Ensure the virtual environment is activated
-2. Check that all dependencies are installed: `pip install -r requirements.txt`
-3. Verify Python version: `python --version` (should be 3.8+)
-4. Check if port 8000 is already in use
-
-### Cannot Access Server
-1. Verify the server is running (check console output)
-2. Try accessing http://127.0.0.1:8000/health first
-3. Check Windows Firewall settings
-4. Ensure no other applications are using port 8000
-
-### Document Upload Issues
-1. Verify file format is supported (PDF, DOCX, TXT)
-2. Check file size (large files may take longer to process)
-3. Ensure the file is not corrupted
-
-## 🔧 Development
-
-### Adding New Features
-1. Modify `working_server.py` for API changes
-2. Update endpoints and business logic as needed
-3. Test using the interactive documentation at `/docs`
-
-### Environment Variables
-Currently, the application runs with default settings. For production deployment, consider adding environment-specific configurations.
-
-## 📝 License
-
-This project is developed for legal document analysis and professional use.
-
-## 🤝 Support
-
-For issues or questions:
-1. Check the troubleshooting section above
-2. Review the interactive API documentation at `/docs`
-3. Verify all prerequisites are met
+Modernised Retrieval-Augmented Generation for legal teams, now powered end-to-end by Google Gemini. This release replaces every OpenAI dependency with Gemini-native generation and embeddings, tightens Qdrant bootstrap, and adds local development fallbacks so you can iterate without rate-limit anxiety.
 
 ---
 
-**Status**: ✅ Active and Running
-**Last Updated**: $(Get-Date -Format "yyyy-MM-dd")
-**Server**: http://127.0.0.1:8000
+## What's New in the Gemini Edition
+
+- **Gemini-native LLM pipeline** – `app/modules/lawfirmchatbot/services/llm.py` now calls the Gemini REST API for chat and doc generation, returning friendly fallback messages when the API is unavailable.
+- **Gemini embeddings + fast retries** – Embedding requests run through the lightweight `_fast_request` helper with deterministic local-mode support.
+- **Local embedding bypass** – Set `USE_LOCAL_EMBEDDINGS=true` to generate deterministic NumPy vectors (seeded per text) when you want to work offline or avoid billing during development.
+- **Automatic Qdrant alias bootstrap** – `core/config.get_qdrant_client()` recreates the `law_docs_gemini_v1` collection if missing and ensures the `law_docs_gemini_current` alias always points to it.
+- **Safer routing** – RAG orchestration now guarantees the retriever is active for QA/DocGen modes and disables it automatically if the alias check fails.
+- **Frontend label update** – The landing page proudly displays **“BRAG AI (Gemini Version)”** so users know which stack they are on.
+
+---
+
+## Feature Overview
+
+- **Document ingestion** – Upload PDFs/DOCX/TXT via the FastAPI endpoints or the lightweight frontend.
+- **Gemini-powered answers** – QA and document drafting run through Gemini (flash/pro) with mode-aware prompts.
+- **Qdrant vector store** – `law_docs_gemini_current` alias targets the active collection for ingestion/search.
+- **Context-aware routing** – The orchestrator inspects every request, toggles retrieval, and enforces placeholder rules for DocGen.
+- **Observability hooks** – Startup logs provide alias status, LLM models in use, and warm-up progress.
+
+---
+
+## Architecture at a Glance
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ FastAPI (app/main.py)                                            │
+│  ├── core.config               → settings + Qdrant bootstrap     │
+│  ├── modules.lawfirmchatbot    → ingestion / RAG / docgen        │
+│  └── services.vector_store     → Qdrant helpers & retries        │
+│                                                                  │
+│ Gemini APIs                                                       │
+│  ├── Text generation (LLM)                                       │
+│  └── Embeddings                                                  │
+│                                                                  │
+│ Qdrant                                                            │
+│  ├── Collection: law_docs_gemini_v1                              │
+│  └── Alias:      law_docs_gemini_current                         │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Prerequisites
+
+- Python 3.9 or newer
+- pip
+- Qdrant instance (cloud or self-hosted) reachable from the backend
+- Google Gemini API key (unless you intend to run in local embedding mode)
+
+---
+
+## Environment Configuration
+
+1. Copy the example environment file:
+   ```bash
+   cp env.template .env
+   ```
+2. Update the following keys (minimum requirements):
+
+   | Variable | Description |
+   |----------|-------------|
+   | `GEMINI_API_KEY` | Primary Gemini key used for chat + embeddings. |
+   | `QDRANT_URL` | Base URL for your Qdrant instance. |
+   | `QDRANT_API_KEY` | (Optional) API key for managed Qdrant. |
+   | `QDRANT_COLLECTION` | Physical collection name (defaults to `law_docs_gemini_v1`). |
+   | `QDRANT_COLLECTION_ALIAS` | Alias consumed by the app (defaults to `law_docs_gemini_current`). |
+
+3. Optional developer toggles:
+
+   ```env
+   USE_LOCAL_EMBEDDINGS=true   # bypass Gemini embeddings with deterministic vectors
+   LOCAL_EMBED_DIM=768         # dimension for local vectors (matches Gemini)
+   ```
+
+---
+
+## Backend Quick Start
+
+```bash
+# 1. Create and activate a virtual environment
+python -m venv .venv
+.\.venv\Scripts\activate        # Windows
+# source .venv/bin/activate     # macOS / Linux
+
+# 2. Install dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 3. Launch the FastAPI server
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The server boot log will confirm:
+
+- Qdrant collection + alias status
+- Gemini model configuration
+- Warm-up embedding/search health
+
+### Useful URLs
+
+- API root: `http://127.0.0.1:8000/`
+- Docs (Swagger): `http://127.0.0.1:8000/docs`
+- Health check: `http://127.0.0.1:8000/healthz`
+
+---
+
+## Frontend Preview (Static)
+
+The frontend is a static HTML/CSS bundle under `frontend/`.
+
+```bash
+cd frontend
+python -m http.server 5500
+```
+
+Open `http://127.0.0.1:5500/index.html` to view the Gemini-branded landing page and navigation shortcuts for ingest/chat.
+
+---
+
+## Document Workflow
+
+1. **Ingest** a PDF/DOCX/TXT via `/api/v1/lawfirm/upload-document` or the UI.
+2. The pipeline:
+   - Extracts text into chunks.
+   - Generates Gemini embeddings (or deterministic vectors if local mode is enabled).
+   - Upserts into Qdrant using the active alias.
+3. **Query** with `/api/v1/lawfirm/query` or the chat UI. The orchestrator:
+   - Detects QA vs DocGen intent.
+   - Pulls relevant context (unless retrieval is intentionally disabled).
+   - Routes the prompt to the Gemini model tier.
+
+---
+
+## Local Embedding Mode
+
+Use this when you need to work offline or want predictable embeddings in tests.
+
+```env
+USE_LOCAL_EMBEDDINGS=true
+LOCAL_EMBED_DIM=768
+```
+
+Effects:
+
+- `_embed_with_gemini` returns a deterministic vector seeded by the text hash.
+- Qdrant writes still occur (handy for smoke tests).
+- LLM responses continue to rely on Gemini unless you add your own guardrails.
+
+Reset the flag to `false` before deploying to production.
+
+---
+
+## Troubleshooting
+
+| Symptom | Resolution |
+|---------|------------|
+| **“Collection alias doesn’t exist”** | Restart the backend; `core.config.get_qdrant_client()` will recreate the collection and alias. |
+| **Gemini 429 rate limit** | The embedding helper already retries once with backoff. For repeated issues, enable `USE_LOCAL_EMBEDDINGS` temporarily. |
+| **Retriever unexpectedly disabled** | Check logs for `[routing] Retriever disabled — missing Qdrant alias.` Confirm alias settings in `.env` and ensure Qdrant is reachable. |
+| **Frontend still shows legacy branding** | Hard refresh the browser (`CTRL+F5`) or clear cache to pick up `frontend/index.html` changes. |
+
+---
+
+## Contributing & Support
+
+- Open issues or feature requests through your team’s tracker.
+- For operational questions, review the logs emitted on startup and during ingestion.
+- Always document new environment variables in this README to keep the Gemini edition aligned.
+
+---
+
+**Status:** Active  
+**Last Updated:** 2025-10-20  
+**Maintainers:** BRAG AI Platform Team
